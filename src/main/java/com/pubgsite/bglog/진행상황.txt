@@ -1,0 +1,31 @@
+- 통계(내부 미개발)
+
+-- 매치히스토리에서 맵별/모드별/결과(치킨,top10)별로 보이기
+
+
+* 닉네임 검색 캐싱
+Caffeine cache
+Redis
+
+* Rate limit
+Bucket4j
+
+*SEO / OG 태그 ??
+og:title
+og:image
+og:description
+
+
+* 수정한 내용
+글로벌탭과 플레이어탭 구분.
+match-detail 병렬처리로 변경. 속도 개선 (?) -> (?)
+localStorage로 최근검색, 즐겨찾기 구현
+
++ 프론트
+react vite?
+vscode redis local말고 render도 가능?
+
+
++ 지금 index.html에서 모든 프론트처리를 해서 무슨 화면을 가든 ~~/index.html로 url이 고정이야.
+보통 사이트의 경우 로그인화면은 ~~/login, 프로필은 ~~/profile, 특정 유저 매치면 ~~/{nickname}/match 이런식일텐데 난 고정이잖아?
+그래서 index.html을 나누기 vs react로 변경하기 고민중이야.
