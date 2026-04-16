@@ -5,8 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pubgsite.bglog.cache.BglogCacheService;
 import com.pubgsite.bglog.dto.*;
 import com.pubgsite.bglog.dto.pubgDTO.*;
-import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -25,10 +25,35 @@ public class MatchService {
         private final PubgApiService apiService;
         private final ObjectMapper mapper;
         private final BglogCacheService cacheService;
+        private final PerformanceMetricsService perf;
 
-        private final ExecutorService matchDetailExecutor = Executors.newFixedThreadPool(8);
+        @Value("${bglog.match.parallelism:8}")
+        private int parallelism;
+
+        @Value("${bglog.match.max-detail-count:200}")
+        private int maxDetailCount;
+
+        @Value("${bglog.match.distinct-enabled:false}")
+        private boolean distinctEnabled;
 
         public List<MatchSummary> getRecentMatchesCached(String platform, String name, Period period) {
+                return getRecentMatchesCached(platform, name, period, true);
+        }
+
+        public List<MatchSummary> getRecentMatchesCached(
+                        String platform,
+                        String name,
+                        Period period,
+                        boolean useRecentMatchesCache) {
+                return getRecentMatchesCached(platform, name, period, useRecentMatchesCache, true);
+        }
+
+        public List<MatchSummary> getRecentMatchesCached(
+                        String platform,
+                        String name,
+                        Period period,
+                        boolean useRecentMatchesCache,
+                        boolean useMatchDetailCache) {
                 String resolvedPlatform = (platform == null || platform.isBlank()) ? "steam" : platform.toLowerCase();
                 String key = resolvedPlatform + ":" + name.toLowerCase() + ":" + period;
 
@@ -38,11 +63,20 @@ public class MatchService {
                                 Duration.ofMinutes(2),
                                 new TypeReference<List<MatchSummary>>() {
                                 },
-                                () -> getRecentMatches(resolvedPlatform, name, period));
+                                useRecentMatchesCache,
+                                () -> getRecentMatches(resolvedPlatform, name, period, useMatchDetailCache));
         }
 
         public List<MatchSummary> getRecentMatches(String platform, String nickname, Period period) {
-                long startedAt = System.currentTimeMillis();
+                return getRecentMatches(platform, nickname, period, true);
+        }
+
+        public List<MatchSummary> getRecentMatches(
+                        String platform,
+                        String nickname,
+                        Period period,
+                        boolean useMatchDetailCache) {
+                long totalStart = perf.start();
 
                 String resolvedPlatform = (platform == null || platform.isBlank()) ? "steam" : platform.toLowerCase();
 
@@ -51,135 +85,190 @@ public class MatchService {
 
                 Instant cutoff = Instant.now().minus(period.getDays(), ChronoUnit.DAYS);
 
-                List<String> targetMatchIds = matchIds.stream()
-                                .limit(200)
+                List<String> limitedMatchIds = matchIds.stream()
+                                .limit(maxDetailCount)
                                 .toList();
 
-                List<CompletableFuture<MatchSummary>> futures = targetMatchIds.stream()
-                                .map(matchId -> CompletableFuture.supplyAsync(
-                                                () -> parseMatch(resolvedPlatform, matchId, playerId),
-                                                matchDetailExecutor))
-                                .toList();
+                List<String> targetMatchIds = distinctEnabled
+                                ? limitedMatchIds.stream().distinct().toList()
+                                : limitedMatchIds;
 
-                List<MatchSummary> result = futures.stream()
-                                .map(CompletableFuture::join)
+                perf.add("match.input.count", limitedMatchIds.size());
+                perf.add("match.target.count", targetMatchIds.size());
+                perf.add("match.duplicate.removed.count", limitedMatchIds.size() - targetMatchIds.size());
+                perf.increment("match.parallelism." + Math.max(1, parallelism));
+
+                List<MatchSummary> parsedMatches;
+
+                if (parallelism <= 1) {
+                        parsedMatches = targetMatchIds.stream()
+                                        .map(matchId -> parseMatch(resolvedPlatform, matchId, playerId, useMatchDetailCache))
+                                        .toList();
+                } else {
+                        ExecutorService executor = Executors.newFixedThreadPool(parallelism);
+                        try {
+                                List<CompletableFuture<MatchSummary>> futures = targetMatchIds.stream()
+                                                .map(matchId -> CompletableFuture.supplyAsync(
+                                                                () -> parseMatch(resolvedPlatform, matchId, playerId,
+                                                                                useMatchDetailCache),
+                                                                executor))
+                                                .toList();
+
+                                parsedMatches = futures.stream()
+                                                .map(CompletableFuture::join)
+                                                .toList();
+                        } finally {
+                        }
+                }
+
+                List<MatchSummary> result = parsedMatches.stream()
                                 .filter(Objects::nonNull)
                                 .filter(m -> m.getCreatedAt() != null && m.getCreatedAt().isAfter(cutoff))
                                 .sorted(Comparator.comparing(MatchSummary::getCreatedAt).reversed())
                                 .toList();
 
-                long elapsed = System.currentTimeMillis() - startedAt;
+                perf.add("match.result.count", result.size());
+                perf.recordTime("match.getRecentMatches.total", totalStart);
+
+                long elapsedMs = Math.round((System.nanoTime() - totalStart) / 1_000_000.0);
                 System.out.println("[MATCH_SERVICE] getRecentMatches platform=" + resolvedPlatform
                                 + " name=" + nickname
                                 + " period=" + period
-                                + " matchIds=" + targetMatchIds.size()
+                                + " inputMatchIds=" + limitedMatchIds.size()
+                                + " targetMatchIds=" + targetMatchIds.size()
                                 + " result=" + result.size()
-                                + " elapsedMs=" + elapsed);
+                                + " parallelism=" + Math.max(1, parallelism)
+                                + " distinctEnabled=" + distinctEnabled
+                                + " useMatchDetailCache=" + useMatchDetailCache
+                                + " elapsedMs=" + elapsedMs);
 
                 return result;
         }
 
-        private MatchSummary parseMatch(String platform, String matchId, String myPlayerId) {
-                Map raw = apiService.getMatchDetail(platform, matchId);
-                MatchResponse match = mapper.convertValue(raw, MatchResponse.class);
+        private MatchSummary parseMatch(String platform, String matchId, String myPlayerId, boolean useMatchDetailCache) {
+                long totalStart = perf.start();
 
-                if (match.getIncluded() == null || match.getData() == null) {
-                        return null;
-                }
+                try {
+                        long detailStart = perf.start();
+                        Map raw = apiService.getMatchDetail(platform, matchId, useMatchDetailCache);
+                        perf.recordTime("match.parse.fetchDetail", detailStart);
 
-                String mode = Optional.ofNullable(match.getData().getAttributes())
-                                .map(MatchAttributes::getGameMode)
-                                .orElse("unknown");
+                        long convertStart = perf.start();
+                        MatchResponse match = mapper.convertValue(raw, MatchResponse.class);
+                        perf.recordTime("match.parse.convertValue", convertStart);
 
-                String map = Optional.ofNullable(match.getData().getAttributes())
-                                .map(MatchAttributes::getMapName)
-                                .orElse("unknown");
-
-                Included myParticipant = match.getIncluded().stream()
-                                .filter(i -> "participant".equals(i.getType()))
-                                .filter(i -> Optional.ofNullable(i.getAttributes())
-                                                .map(Attributes::getStats)
-                                                .map(Stats::getPlayerId)
-                                                .map(pid -> pid.equals(myPlayerId))
-                                                .orElse(false))
-                                .findFirst()
-                                .orElse(null);
-
-                if (myParticipant == null
-                                || myParticipant.getAttributes() == null
-                                || myParticipant.getAttributes().getStats() == null) {
-                        return null;
-                }
-
-                Stats stats = myParticipant.getAttributes().getStats();
-                String myParticipantId = myParticipant.getId();
-
-                Included myRoster = match.getIncluded().stream()
-                                .filter(i -> "roster".equals(i.getType()))
-                                .filter(r -> Optional.ofNullable(r.getRelationships())
-                                                .map(Relationships::getParticipants)
-                                                .map(Participants::getData)
-                                                .orElse(List.of())
-                                                .stream()
-                                                .anyMatch(d -> myParticipantId.equals(d.getId())))
-                                .findFirst()
-                                .orElse(null);
-
-                List<String> teamNames = new ArrayList<>();
-
-                if (myRoster != null) {
-                        List<RosterData> members = Optional.ofNullable(myRoster.getRelationships())
-                                        .map(Relationships::getParticipants)
-                                        .map(Participants::getData)
-                                        .orElse(List.of());
-
-                        for (RosterData member : members) {
-                                match.getIncluded().stream()
-                                                .filter(i -> "participant".equals(i.getType()))
-                                                .filter(i -> member.getId().equals(i.getId()))
-                                                .findFirst()
-                                                .ifPresent(p -> {
-                                                        String name = Optional.ofNullable(p.getAttributes())
-                                                                        .map(Attributes::getStats)
-                                                                        .map(Stats::getName)
-                                                                        .orElse("unknown");
-                                                        teamNames.add(name);
-                                                });
+                        if (match.getIncluded() == null || match.getData() == null) {
+                                perf.increment("match.parse.skipped.invalidPayload");
+                                return null;
                         }
 
-                        teamNames.sort((a, b) -> {
-                                if (a.equalsIgnoreCase(stats.getName()))
-                                        return -1;
-                                if (b.equalsIgnoreCase(stats.getName()))
-                                        return 1;
-                                return a.compareToIgnoreCase(b);
-                        });
+                        String mode = Optional.ofNullable(match.getData().getAttributes())
+                                        .map(MatchAttributes::getGameMode)
+                                        .orElse("unknown");
+
+                        String map = Optional.ofNullable(match.getData().getAttributes())
+                                        .map(MatchAttributes::getMapName)
+                                        .orElse("unknown");
+
+                        long findParticipantStart = perf.start();
+                        Included myParticipant = match.getIncluded().stream()
+                                        .filter(i -> "participant".equals(i.getType()))
+                                        .filter(i -> Optional.ofNullable(i.getAttributes())
+                                                        .map(Attributes::getStats)
+                                                        .map(Stats::getPlayerId)
+                                                        .map(pid -> pid.equals(myPlayerId))
+                                                        .orElse(false))
+                                        .findFirst()
+                                        .orElse(null);
+                        perf.recordTime("match.parse.findMyParticipant", findParticipantStart);
+
+                        if (myParticipant == null
+                                        || myParticipant.getAttributes() == null
+                                        || myParticipant.getAttributes().getStats() == null) {
+                                perf.increment("match.parse.skipped.noParticipant");
+                                return null;
+                        }
+
+                        Stats stats = myParticipant.getAttributes().getStats();
+                        String myParticipantId = myParticipant.getId();
+
+                        long findRosterStart = perf.start();
+                        Included myRoster = match.getIncluded().stream()
+                                        .filter(i -> "roster".equals(i.getType()))
+                                        .filter(r -> Optional.ofNullable(r.getRelationships())
+                                                        .map(Relationships::getParticipants)
+                                                        .map(Participants::getData)
+                                                        .orElse(List.of())
+                                                        .stream()
+                                                        .anyMatch(d -> myParticipantId.equals(d.getId())))
+                                        .findFirst()
+                                        .orElse(null);
+                        perf.recordTime("match.parse.findMyRoster", findRosterStart);
+
+                        long teamNamesStart = perf.start();
+                        List<String> teamNames = new ArrayList<>();
+
+                        if (myRoster != null) {
+                                List<RosterData> members = Optional.ofNullable(myRoster.getRelationships())
+                                                .map(Relationships::getParticipants)
+                                                .map(Participants::getData)
+                                                .orElse(List.of());
+
+                                for (RosterData member : members) {
+                                        match.getIncluded().stream()
+                                                        .filter(i -> "participant".equals(i.getType()))
+                                                        .filter(i -> member.getId().equals(i.getId()))
+                                                        .findFirst()
+                                                        .ifPresent(p -> {
+                                                                String name = Optional.ofNullable(p.getAttributes())
+                                                                                .map(Attributes::getStats)
+                                                                                .map(Stats::getName)
+                                                                                .orElse("unknown");
+                                                                teamNames.add(name);
+                                                        });
+                                }
+
+                                teamNames.sort((a, b) -> {
+                                        if (a.equalsIgnoreCase(stats.getName()))
+                                                return -1;
+                                        if (b.equalsIgnoreCase(stats.getName()))
+                                                return 1;
+                                        return a.compareToIgnoreCase(b);
+                                });
+                        }
+                        perf.recordTime("match.parse.teamNames", teamNamesStart);
+
+                        Instant createdAt = Optional.ofNullable(match.getData().getAttributes())
+                                        .map(MatchAttributes::getCreatedAt)
+                                        .map(Instant::parse)
+                                        .orElse(Instant.now());
+
+                        long rosterCountStart = perf.start();
+                        int totalTeamCount = (int) match.getIncluded().stream()
+                                        .filter(i -> "roster".equals(i.getType()))
+                                        .count();
+                        perf.recordTime("match.parse.countRosters", rosterCountStart);
+
+                        perf.increment("match.parse.success");
+
+                        return new MatchSummary(
+                                        matchId,
+                                        modeToKr(mode),
+                                        mapToKr(map),
+                                        stats.getWinPlace(),
+                                        totalTeamCount,
+                                        stats.getKills(),
+                                        stats.getHeadshotKills(),
+                                        stats.getDamageDealt(),
+                                        stats.getAssists(),
+                                        stats.getDBNOs(),
+                                        stats.getLongestKill(),
+                                        stats.getTimeSurvived(),
+                                        teamNames,
+                                        createdAt);
+                } finally {
+                        perf.recordTime("match.parse.total", totalStart);
                 }
-
-                Instant createdAt = Optional.ofNullable(match.getData().getAttributes())
-                                .map(MatchAttributes::getCreatedAt)
-                                .map(Instant::parse)
-                                .orElse(Instant.now());
-
-                int totalTeamCount = (int) match.getIncluded().stream()
-                                .filter(i -> "roster".equals(i.getType()))
-                                .count();
-
-                return new MatchSummary(
-                                matchId,
-                                modeToKr(mode),
-                                mapToKr(map),
-                                stats.getWinPlace(),
-                                totalTeamCount,
-                                stats.getKills(),
-                                stats.getHeadshotKills(),
-                                stats.getDamageDealt(),
-                                stats.getAssists(),
-                                stats.getDBNOs(),
-                                stats.getLongestKill(),
-                                stats.getTimeSurvived(),
-                                teamNames,
-                                createdAt);
         }
 
         public Map<String, PlayerStatsSummary> calculateStats(List<MatchSummary> matches, Period period) {
@@ -234,18 +323,49 @@ public class MatchService {
         }
 
         public SummaryResponse buildSummaryCached(String platform, String nickname, Period period, int limit) {
+                return buildSummaryCached(platform, nickname, period, limit, true, true);
+        }
+
+        public SummaryResponse buildSummaryCached(
+                        String platform,
+                        String nickname,
+                        Period period,
+                        int limit,
+                        boolean useSummaryCache,
+                        boolean useRecentMatchesCache) {
                 String resolvedPlatform = (platform == null ? "steam" : platform.toLowerCase());
                 String key = resolvedPlatform + ":RECENT:" + nickname.toLowerCase() + ":" + period + ":" + limit;
 
-                return cacheService.getOrCompute("summary", key, Duration.ofMinutes(2), SummaryResponse.class,
-                                () -> buildSummary(resolvedPlatform, nickname, period, limit));
+                return cacheService.getOrCompute(
+                                "summary",
+                                key,
+                                Duration.ofMinutes(2),
+                                SummaryResponse.class,
+                                useSummaryCache,
+                                () -> buildSummary(resolvedPlatform, nickname, period, limit, useRecentMatchesCache,
+                                                true));
         }
 
         public SummaryResponse buildSummary(String platform, String nickname, Period period, int limit) {
-                List<MatchSummary> matches = getRecentMatchesCached(platform, nickname, period).stream()
-                                .filter(Objects::nonNull)
-                                .filter(m -> !"아케이드".equals(m.getMode()))
-                                .toList();
+                return buildSummary(platform, nickname, period, limit, true, true);
+        }
+
+        public SummaryResponse buildSummary(
+                        String platform,
+                        String nickname,
+                        Period period,
+                        int limit,
+                        boolean useRecentMatchesCache,
+                        boolean useMatchDetailCache) {
+                List<MatchSummary> matches = getRecentMatchesCached(
+                                platform,
+                                nickname,
+                                period,
+                                useRecentMatchesCache,
+                                useMatchDetailCache).stream()
+                                                .filter(Objects::nonNull)
+                                                .filter(m -> !"아케이드".equals(m.getMode()))
+                                                .toList();
 
                 if (matches.size() > limit) {
                         matches = matches.subList(0, limit);
@@ -336,8 +456,15 @@ public class MatchService {
                 return MODE_KR.getOrDefault(mode, mode);
         }
 
-        @PreDestroy
-        public void shutdown() {
-                matchDetailExecutor.shutdown();
+        public int getParallelism() {
+                return parallelism;
+        }
+
+        public int getMaxDetailCount() {
+                return maxDetailCount;
+        }
+
+        public boolean isDistinctEnabled() {
+                return distinctEnabled;
         }
 }

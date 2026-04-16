@@ -40,6 +40,7 @@ public class PubgApiService {
 
     private final BglogCacheService cacheService;
     private final ObjectMapper objectMapper;
+    private final PerformanceMetricsService perf;
 
     private final RestTemplate restTemplate = new RestTemplate();
 
@@ -67,6 +68,20 @@ public class PubgApiService {
         headers.set("Authorization", "Bearer " + apiKey);
         headers.set("Accept", "application/vnd.api+json");
         return new HttpEntity<>(headers);
+    }
+
+    private <T> T measureApi(String metricName, java.util.function.Supplier<T> action) {
+        long startedAt = perf.start();
+        try {
+            T result = action.get();
+            perf.increment("api." + metricName + ".success");
+            return result;
+        } catch (RuntimeException e) {
+            perf.increment("api." + metricName + ".error");
+            throw e;
+        } finally {
+            perf.recordTime("api." + metricName, startedAt);
+        }
     }
 
     // -------------------------
@@ -109,25 +124,27 @@ public class PubgApiService {
 
         logCounter("players_lookup", CALL_PLAYER_LOOKUP, "platform=" + shard + " name=" + name);
 
-        String encoded = UriUtils.encodeQueryParam(name, StandardCharsets.UTF_8);
-        String url = baseUrl + "/shards/" + shard + "/players?filter[playerNames]=" + encoded;
+        return measureApi("players_lookup", () -> {
+            String encoded = UriUtils.encodeQueryParam(name, StandardCharsets.UTF_8);
+            String url = baseUrl + "/shards/" + shard + "/players?filter[playerNames]=" + encoded;
 
-        try {
-            ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), Map.class);
+            try {
+                ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), Map.class);
 
-            List<?> data = Optional.ofNullable(response.getBody())
-                    .map(b -> (List<?>) b.get("data"))
-                    .orElseThrow(() -> new PlayerNotFoundException(name));
+                List<?> data = Optional.ofNullable(response.getBody())
+                        .map(b -> (List<?>) b.get("data"))
+                        .orElseThrow(() -> new PlayerNotFoundException(name));
 
-            if (data.isEmpty()) {
+                if (data.isEmpty()) {
+                    throw new PlayerNotFoundException(name);
+                }
+
+                Map<?, ?> player = (Map<?, ?>) data.get(0);
+                return String.valueOf(player.get("id"));
+            } catch (HttpClientErrorException.NotFound e) {
                 throw new PlayerNotFoundException(name);
             }
-
-            Map<?, ?> player = (Map<?, ?>) data.get(0);
-            return String.valueOf(player.get("id"));
-        } catch (HttpClientErrorException.NotFound e) {
-            throw new PlayerNotFoundException(name);
-        }
+        });
     }
 
     // -------------------------
@@ -147,47 +164,56 @@ public class PubgApiService {
 
         logCounter("player_matches", CALL_PLAYER_MATCHES, "platform=" + shard + " playerId=" + playerId);
 
-        String url = baseUrl + "/shards/" + shard + "/players/" + playerId;
+        return measureApi("player_matches", () -> {
+            String url = baseUrl + "/shards/" + shard + "/players/" + playerId;
 
-        try {
-            ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), Map.class);
+            try {
+                ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), Map.class);
 
-            Map<?, ?> body = Optional.ofNullable(response.getBody())
-                    .orElseThrow(() -> new PlayerNotFoundException(playerId));
+                Map<?, ?> body = Optional.ofNullable(response.getBody())
+                        .orElseThrow(() -> new PlayerNotFoundException(playerId));
 
-            Map<?, ?> data = (Map<?, ?>) body.get("data");
-            Map<?, ?> relationships = (Map<?, ?>) data.get("relationships");
-            Map<?, ?> matches = (Map<?, ?>) relationships.get("matches");
+                Map<?, ?> data = (Map<?, ?>) body.get("data");
+                Map<?, ?> relationships = (Map<?, ?>) data.get("relationships");
+                Map<?, ?> matches = (Map<?, ?>) relationships.get("matches");
 
-            List<Map<?, ?>> matchData = (List<Map<?, ?>>) matches.get("data");
+                List<Map<?, ?>> matchData = (List<Map<?, ?>>) matches.get("data");
 
-            return matchData.stream()
-                    .map(m -> String.valueOf(m.get("id")))
-                    .toList();
+                return matchData.stream()
+                        .map(m -> String.valueOf(m.get("id")))
+                        .toList();
 
-        } catch (HttpClientErrorException.NotFound e) {
-            throw new PlayerNotFoundException(playerId);
-        }
+            } catch (HttpClientErrorException.NotFound e) {
+                throw new PlayerNotFoundException(playerId);
+            }
+        });
     }
 
     public Map getMatchDetail(String platform, String matchId) {
+        return getMatchDetail(platform, matchId, true);
+    }
+
+    public Map getMatchDetail(String platform, String matchId, boolean useMatchDetailCache) {
         PubgPlatform p = PubgPlatform.from(platform);
         String shard = p.shard();
 
         String key = shard + ":match:" + matchId;
 
-        return cacheService.getOrCompute("matchDetail", key, Duration.ofHours(24), Map.class, () -> {
+        return cacheService.getOrCompute("matchDetail", key, Duration.ofHours(24), Map.class, useMatchDetailCache, () -> {
             logCounter("match_detail", CALL_MATCH_DETAIL, "platform=" + shard + " matchId=" + matchId);
 
-            String url = baseUrl + "/shards/" + shard + "/matches/" + matchId;
+            return measureApi("match_detail", () -> {
+                String url = baseUrl + "/shards/" + shard + "/matches/" + matchId;
 
-            try {
-                ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(), Map.class);
-                return Optional.ofNullable(response.getBody())
-                        .orElseThrow(() -> new MatchNotFoundException(matchId));
-            } catch (HttpClientErrorException.NotFound e) {
-                throw new MatchNotFoundException(matchId);
-            }
+                try {
+                    ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, createEntity(),
+                            Map.class);
+                    return Optional.ofNullable(response.getBody())
+                            .orElseThrow(() -> new MatchNotFoundException(matchId));
+                } catch (HttpClientErrorException.NotFound e) {
+                    throw new MatchNotFoundException(matchId);
+                }
+            });
         });
     }
 
@@ -202,22 +228,24 @@ public class PubgApiService {
         return cacheService.getOrCompute("currentSeason", key, Duration.ofHours(1), String.class, () -> {
             logCounter("seasons", CALL_SEASONS, "platform=" + shard);
 
-            String url = baseUrl + "/shards/" + shard + "/seasons";
-            ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
+            return measureApi("seasons", () -> {
+                String url = baseUrl + "/shards/" + shard + "/seasons";
+                ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
 
-            try {
-                JsonNode root = objectMapper.readTree(res.getBody());
-                for (JsonNode s : root.path("data")) {
-                    boolean isCurrent = s.path("attributes").path("isCurrentSeason").asBoolean(false);
-                    if (isCurrent) {
-                        return s.path("id").asText();
+                try {
+                    JsonNode root = objectMapper.readTree(res.getBody());
+                    for (JsonNode s : root.path("data")) {
+                        boolean isCurrent = s.path("attributes").path("isCurrentSeason").asBoolean(false);
+                        if (isCurrent) {
+                            return s.path("id").asText();
+                        }
                     }
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to parse seasons", e);
                 }
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to parse seasons", e);
-            }
 
-            throw new IllegalStateException("Current season not found");
+                throw new IllegalStateException("Current season not found");
+            });
         });
     }
 
@@ -236,14 +264,16 @@ public class PubgApiService {
         logCounter("season_stats", CALL_SEASON_STATS,
                 "platform=" + shard + " accountId=" + accountId + " seasonId=" + seasonId);
 
-        String url = baseUrl + "/shards/" + shard + "/players/" + accountId + "/seasons/" + seasonId;
-        ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
+        return measureApi("season_stats", () -> {
+            String url = baseUrl + "/shards/" + shard + "/players/" + accountId + "/seasons/" + seasonId;
+            ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
 
-        try {
-            return objectMapper.readTree(res.getBody());
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse season stats", e);
-        }
+            try {
+                return objectMapper.readTree(res.getBody());
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to parse season stats", e);
+            }
+        });
     }
 
     // -------------------------
@@ -264,14 +294,16 @@ public class PubgApiService {
         logCounter("ranked_stats", CALL_RANKED_STATS,
                 "platform=" + shard + " accountId=" + accountId + " seasonId=" + seasonId);
 
-        String url = baseUrl + "/shards/" + shard + "/players/" + accountId + "/seasons/" + seasonId + "/ranked";
-        ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
+        return measureApi("ranked_stats", () -> {
+            String url = baseUrl + "/shards/" + shard + "/players/" + accountId + "/seasons/" + seasonId + "/ranked";
+            ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
 
-        try {
-            return objectMapper.readTree(res.getBody());
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse ranked stats", e);
-        }
+            try {
+                return objectMapper.readTree(res.getBody());
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to parse ranked stats", e);
+            }
+        });
     }
 
     public RankedCardResponse getRankedCard(String platform, String name, String mode) {
@@ -362,22 +394,30 @@ public class PubgApiService {
     }
 
     private String normalizeRankedMode(String mode) {
-        if (mode == null) return "squad";
+        if (mode == null)
+            return "squad";
         String m = mode.toLowerCase();
 
-        if (m.equals("squad-fpp") || m.equals("squadfpp") || m.equals("squad_fpp")) return "squad";
-        if (m.equals("duo-fpp") || m.equals("duofpp") || m.equals("duo_fpp")) return "duo";
+        if (m.equals("squad-fpp") || m.equals("squadfpp") || m.equals("squad_fpp"))
+            return "squad";
+        if (m.equals("duo-fpp") || m.equals("duofpp") || m.equals("duo_fpp"))
+            return "duo";
 
-        if (m.startsWith("squad")) return "squad";
-        if (m.startsWith("duo")) return "duo";
+        if (m.startsWith("squad"))
+            return "squad";
+        if (m.startsWith("duo"))
+            return "duo";
 
         return m;
     }
 
     private String pickRankedFallbackMode(List<String> availableModes) {
-        if (availableModes == null || availableModes.isEmpty()) return null;
-        if (availableModes.contains("squad")) return "squad";
-        if (availableModes.contains("duo")) return "duo";
+        if (availableModes == null || availableModes.isEmpty())
+            return null;
+        if (availableModes.contains("squad"))
+            return "squad";
+        if (availableModes.contains("duo"))
+            return "duo";
         return availableModes.get(0);
     }
 
@@ -412,14 +452,16 @@ public class PubgApiService {
         logCounter("leaderboard", CALL_LEADERBOARD,
                 "platform=" + leaderboardShard + " seasonId=" + seasonId + " mode=" + mode);
 
-        String url = baseUrl + "/shards/" + leaderboardShard + "/leaderboards/" + seasonId + "/" + mode;
-        ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
+        return measureApi("leaderboard", () -> {
+            String url = baseUrl + "/shards/" + leaderboardShard + "/leaderboards/" + seasonId + "/" + mode;
+            ResponseEntity<String> res = restTemplate.exchange(url, HttpMethod.GET, createEntity(), String.class);
 
-        try {
-            return objectMapper.readTree(res.getBody());
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to parse leaderboard", e);
-        }
+            try {
+                return objectMapper.readTree(res.getBody());
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to parse leaderboard", e);
+            }
+        });
     }
 
     public LeaderboardResponse getLeaderboard(String platform, String seasonId, String mode) {
@@ -435,7 +477,8 @@ public class PubgApiService {
 
         if (included != null && included.isArray()) {
             for (JsonNode node : included) {
-                if (!"player".equals(node.path("type").asText(""))) continue;
+                if (!"player".equals(node.path("type").asText("")))
+                    continue;
 
                 String name = node.path("attributes").path("name").asText("");
                 JsonNode stats = node.path("attributes").path("stats");

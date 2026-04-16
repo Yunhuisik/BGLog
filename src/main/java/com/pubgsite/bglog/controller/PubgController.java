@@ -1,8 +1,10 @@
 package com.pubgsite.bglog.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.pubgsite.bglog.cache.BglogCacheService;
 import com.pubgsite.bglog.dto.*;
 import com.pubgsite.bglog.service.MatchService;
+import com.pubgsite.bglog.service.PerformanceMetricsService;
 import com.pubgsite.bglog.service.PubgApiService;
 import com.pubgsite.bglog.service.SeasonSummaryService;
 import lombok.RequiredArgsConstructor;
@@ -21,25 +23,52 @@ public class PubgController {
         private final MatchService matchService;
         private final SeasonSummaryService seasonSummaryService;
         private final PubgApiService pubgApiService;
+        private final PerformanceMetricsService performanceMetricsService;
+        private final BglogCacheService bglogCacheService;
 
         @GetMapping("/health")
         public String health() {
                 return "ok";
         }
 
-        /**
-         * 실제 검색 진입점
-         * - 프론트 첫 검색은 가능하면 이 엔드포인트 사용
-         * - 검색 성공 시 recent search 기록
-         */
+        @GetMapping("/perf")
+        public Map<String, Object> perf() {
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("matchParallelism", matchService.getParallelism());
+                out.put("matchMaxDetailCount", matchService.getMaxDetailCount());
+                out.put("matchDistinctEnabled", matchService.isDistinctEnabled());
+                out.putAll(performanceMetricsService.snapshot());
+                return out;
+        }
+
+        @PostMapping("/perf/reset")
+        public Map<String, String> resetPerf() {
+                performanceMetricsService.reset();
+                return Map.of("status", "ok");
+        }
+
+        @PostMapping("/perf/cache/reset")
+        public Map<String, String> resetCache() {
+                bglogCacheService.clearAll();
+                return Map.of("status", "ok");
+        }
+
         @GetMapping("/search")
         public SummaryResponse search(
                         @RequestParam(value = "platform", required = false, defaultValue = "steam") String platform,
                         @RequestParam("name") String name,
                         @RequestParam(value = "period", defaultValue = "WEEK") Period period,
                         @RequestParam(value = "limit", defaultValue = "20") int limit,
-                        @RequestParam(value = "seasonId", required = false) String seasonId) {
-                SummaryResponse base = matchService.buildSummaryCached(platform, name, period, limit);
+                        @RequestParam(value = "seasonId", required = false) String seasonId,
+                        @RequestParam(value = "useSummaryCache", defaultValue = "true") boolean useSummaryCache,
+                        @RequestParam(value = "useRecentMatchesCache", defaultValue = "true") boolean useRecentMatchesCache) {
+                SummaryResponse base = matchService.buildSummaryCached(
+                                platform,
+                                name,
+                                period,
+                                limit,
+                                useSummaryCache,
+                                useRecentMatchesCache);
                 SeasonSummaryResponse season = seasonSummaryService.build(platform, name, seasonId);
 
                 return new SummaryResponse(
@@ -73,8 +102,15 @@ public class PubgController {
                         @RequestParam(value = "platform", required = false, defaultValue = "steam") String platform,
                         @RequestParam("name") String name,
                         @RequestParam(value = "period", required = false, defaultValue = "DAY") Period period,
-                        @RequestParam(value = "limit", required = false, defaultValue = "20") int limit) {
-                List<MatchSummary> matches = matchService.getRecentMatches(platform, name, period);
+                        @RequestParam(value = "limit", required = false, defaultValue = "20") int limit,
+                        @RequestParam(value = "useRecentMatchesCache", defaultValue = "true") boolean useRecentMatchesCache,
+                        @RequestParam(value = "useMatchDetailCache", defaultValue = "true") boolean useMatchDetailCache) {
+                List<MatchSummary> matches = matchService.getRecentMatchesCached(
+                                platform,
+                                name,
+                                period,
+                                useRecentMatchesCache,
+                                useMatchDetailCache);
 
                 if (limit < 1)
                         limit = 1;
@@ -88,8 +124,15 @@ public class PubgController {
         public List<MatchSummary> matches(
                         @RequestParam(value = "platform", required = false, defaultValue = "steam") String platform,
                         @RequestParam("name") String name,
-                        @RequestParam("period") Period period) {
-                return matchService.getRecentMatches(platform, name, period);
+                        @RequestParam("period") Period period,
+                        @RequestParam(value = "useRecentMatchesCache", defaultValue = "false") boolean useRecentMatchesCache,
+                        @RequestParam(value = "useMatchDetailCache", defaultValue = "false") boolean useMatchDetailCache) {
+                return matchService.getRecentMatchesCached(
+                                platform,
+                                name,
+                                period,
+                                useRecentMatchesCache,
+                                useMatchDetailCache);
         }
 
         @GetMapping("/stats")
@@ -118,8 +161,16 @@ public class PubgController {
                         @RequestParam(value = "period", defaultValue = "WEEK") Period period,
                         @RequestParam(value = "limit", defaultValue = "20") int limit,
                         @RequestParam(value = "scope", defaultValue = "RECENT") SummaryScope scope,
-                        @RequestParam(value = "seasonId", required = false) String seasonId) {
-                SummaryResponse base = matchService.buildSummaryCached(platform, name, period, limit);
+                        @RequestParam(value = "seasonId", required = false) String seasonId,
+                        @RequestParam(value = "useSummaryCache", defaultValue = "true") boolean useSummaryCache,
+                        @RequestParam(value = "useRecentMatchesCache", defaultValue = "true") boolean useRecentMatchesCache) {
+                SummaryResponse base = matchService.buildSummaryCached(
+                                platform,
+                                name,
+                                period,
+                                limit,
+                                useSummaryCache,
+                                useRecentMatchesCache);
                 SeasonSummaryResponse season = seasonSummaryService.build(platform, name, seasonId);
 
                 return new SummaryResponse(
